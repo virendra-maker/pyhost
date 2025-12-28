@@ -3,7 +3,11 @@ import logging
 import asyncio
 import sqlite3
 import aiosqlite
-from datetime import datetime, timedelta
+import subprocess
+import sys
+import psutil
+import shutil
+from datetime import datetime
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -32,259 +36,251 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Database Setup
+# Paths
 DB_PATH = "bot_database.db"
+HOSTED_DIR = "hosted_bots"
+LOGS_DIR = "logs"
 
+os.makedirs(HOSTED_DIR, exist_ok=True)
+os.makedirs(LOGS_DIR, exist_ok=True)
+
+# Database Setup
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 username TEXT,
-                join_date TEXT,
-                role TEXT DEFAULT 'free',
-                credits INTEGER DEFAULT 3,
-                premium_expiry TEXT,
+                role TEXT DEFAULT 'member',
                 is_banned INTEGER DEFAULT 0
             )
         ''')
         await db.execute('''
-            CREATE TABLE IF NOT EXISTS admins (
-                user_id INTEGER PRIMARY KEY
+            CREATE TABLE IF NOT EXISTS hosted_apps (
+                app_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                app_name TEXT,
+                path TEXT,
+                status TEXT DEFAULT 'stopped',
+                pid INTEGER
             )
         ''')
         # Add initial admins
-        await db.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (OWNER_ID,))
-        await db.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (ADMIN_ID,))
+        await db.execute("INSERT OR IGNORE INTO users (user_id, role) VALUES (?, 'admin')", (OWNER_ID,))
+        await db.execute("INSERT OR IGNORE INTO users (user_id, role) VALUES (?, 'admin')", (ADMIN_ID,))
         await db.commit()
 
-# Helper Functions
-async def is_admin(user_id):
-    if user_id == OWNER_ID:
+# Middleware/Checks
+async def is_team_member(user_id):
+    if user_id == OWNER_ID or user_id == ADMIN_ID:
         return True
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT 1 FROM admins WHERE user_id = ?", (user_id,)) as cursor:
+        async with db.execute("SELECT 1 FROM users WHERE user_id = ? AND is_banned = 0", (user_id,)) as cursor:
             return await cursor.fetchone() is not None
-
-async def check_force_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # This is a simplified check. In production, you'd use context.bot.get_chat_member
-    # For now, we assume the user needs to join the channel in the .env
-    channel_username = UPDATE_CHANNEL.split('/')[-1]
-    try:
-        member = await context.bot.get_chat_member(chat_id=f"@{channel_username}", user_id=update.effective_user.id)
-        if member.status in ['member', 'administrator', 'creator']:
-            return True
-    except Exception as e:
-        logger.error(f"Error checking force join: {e}")
-    return False
-
-async def get_user(user_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = sqlite3.Row
-        async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cursor:
-            return await cursor.fetchone()
-
-async def register_user(user_id, username):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT OR IGNORE INTO users (user_id, username, join_date) VALUES (?, ?, ?)",
-            (user_id, username, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-        )
-        await db.commit()
 
 # Command Handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    await register_user(user.id, user.username)
-    
-    if not await check_force_join(update, context):
-        keyboard = [[InlineKeyboardButton("Join Channel", url=UPDATE_CHANNEL)],
-                    [InlineKeyboardButton("I have joined", callback_data="check_join")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(
-            f"Welcome {user.first_name}! To use this bot, you must join our update channel.",
-            reply_markup=reply_markup
-        )
+    if not await is_team_member(user.id):
+        await update.message.reply_text("❌ Access Denied. This bot is for private team use only.")
         return
 
     await update.message.reply_text(
-        f"Hello {user.first_name}! Welcome to the PyHost Bot.\n"
-        "Use /help to see available commands."
+        f"🚀 Welcome {user.first_name} to PyHost Team Panel!\n\n"
+        "Commands:\n"
+        "📂 Send any .py file to host it\n"
+        "/apps - List your hosted apps\n"
+        "/stop <app_id> - Stop an app\n"
+        "/start_app <app_id> - Start an app\n"
+        "/delete <app_id> - Delete an app\n"
+        "/status - System status"
     )
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = (
-        "Available Commands:\n"
-        "/start - Start the bot\n"
-        "/profile - View your profile and credits\n"
-        "/buy - Premium information\n"
-        "/help - Show this message\n"
-    )
-    if await is_admin(update.effective_user.id):
-        help_text += (
-            "\nAdmin Commands:\n"
-            "/stats - Bot statistics\n"
-            "/broadcast <msg> - Send message to all users\n"
-            "/addpremium <id> <days> - Add premium to user\n"
-            "/givecredits <id> <amt> - Give credits to user\n"
-            "/ban <id> - Ban a user\n"
-            "/unban <id> - Unban a user\n"
-        )
-    await update.message.reply_text(help_text)
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not await is_team_member(user.id): return
 
-async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_data = await get_user(update.effective_user.id)
-    if not user_data:
-        await update.message.reply_text("Please /start the bot first.")
+    doc = update.message.document
+    if not doc.file_name.endswith('.py'):
+        await update.message.reply_text("❌ Please send a .py file.")
         return
 
-    status = "Premium 🌟" if user_data['role'] == 'premium' else "Free"
-    expiry = user_data['premium_expiry'] if user_data['premium_expiry'] else "N/A"
+    app_name = doc.file_name
+    user_dir = os.path.join(HOSTED_DIR, str(user.id))
+    os.makedirs(user_dir, exist_ok=True)
     
-    profile_text = (
-        f"👤 Profile: {update.effective_user.first_name}\n"
-        f"🆔 ID: {user_data['user_id']}\n"
-        f"🎭 Role: {status}\n"
-        f"💰 Credits: {user_data['credits']}\n"
-        f"📅 Joined: {user_data['join_date']}\n"
-        f"⏳ Premium Expiry: {expiry}"
-    )
-    await update.message.reply_text(profile_text)
+    file_path = os.path.join(user_dir, app_name)
+    new_file = await context.bot.get_file(doc.file_id)
+    await new_file.download_to_drive(file_path)
 
-async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    buy_text = (
-        "💎 Premium Benefits:\n"
-        "- Unlimited Credits\n"
-        "- Priority Support\n"
-        "- Ad-free experience\n\n"
-        "To buy premium, contact: " + YOUR_USERNAME
-    )
-    await update.message.reply_text(buy_text)
+    await update.message.reply_text(f"📥 Received {app_name}. Analyzing dependencies...")
 
-# Admin Handlers
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id): return
-    
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT COUNT(*) FROM users") as cursor:
-            total_users = (await cursor.fetchone())[0]
-        async with db.execute("SELECT COUNT(*) FROM users WHERE role = 'premium'") as cursor:
-            premium_users = (await cursor.fetchone())[0]
+    # Auto-install modules (simple regex check for imports)
+    try:
+        with open(file_path, 'r') as f:
+            content = f.read()
+            import_lines = [line for line in content.split('\n') if line.startswith('import ') or line.startswith('from ')]
+            modules = []
+            for line in import_lines:
+                parts = line.split()
+                if parts[0] == 'import':
+                    modules.append(parts[1].split('.')[0])
+                elif parts[0] == 'from':
+                    modules.append(parts[1].split('.')[0])
             
-    await update.message.reply_text(f"📊 Bot Stats:\nTotal Users: {total_users}\nPremium Users: {premium_users}")
+            unique_modules = list(set(modules))
+            # Filter out standard libraries (simplified)
+            std_libs = ['os', 'sys', 'time', 'datetime', 'json', 're', 'math', 'random', 'asyncio', 'logging', 'sqlite3']
+            to_install = [m for m in unique_modules if m not in std_libs]
 
-async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id): return
-    if not context.args:
-        await update.message.reply_text("Usage: /broadcast <message>")
-        return
-    
-    msg = " ".join(context.args)
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT user_id FROM users") as cursor:
-            users = await cursor.fetchall()
-            
-    count = 0
-    for user in users:
-        try:
-            await context.bot.send_message(chat_id=user[0], text=f"📢 BROADCAST:\n\n{msg}")
-            count += 1
-        except Exception:
-            pass
-    await update.message.reply_text(f"✅ Broadcast sent to {count} users.")
+            if to_install:
+                await update.message.reply_text(f"📦 Installing: {', '.join(to_install)}")
+                subprocess.check_call([sys.executable, "-m", "pip", "install"] + to_install)
 
-async def add_premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id): return
-    if len(context.args) < 2:
-        await update.message.reply_text("Usage: /addpremium <user_id> <days>")
-        return
-    
-    target_id = int(context.args[0])
-    days = int(context.args[1])
-    expiry_date = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
-    
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Dependency check failed: {e}")
+
+    # Register in DB
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "UPDATE users SET role = 'premium', premium_expiry = ? WHERE user_id = ?",
-            (expiry_date, target_id)
+            "INSERT INTO hosted_apps (user_id, app_name, path, status) VALUES (?, ?, ?, ?)",
+            (user.id, app_name, file_path, 'stopped')
         )
         await db.commit()
-    
-    await update.message.reply_text(f"✅ User {target_id} is now Premium for {days} days.")
+        async with db.execute("SELECT last_insert_rowid()") as cursor:
+            app_id = (await cursor.fetchone())[0]
 
-async def give_credits(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id): return
-    if len(context.args) < 2:
-        await update.message.reply_text("Usage: /givecredits <user_id> <amount>")
-        return
-    
-    target_id = int(context.args[0])
-    amount = int(context.args[1])
-    
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET credits = credits + ? WHERE user_id = ?", (amount, target_id))
-        await db.commit()
-    
-    await update.message.reply_text(f"✅ Added {amount} credits to user {target_id}.")
+    await update.message.reply_text(f"✅ App registered with ID: {app_id}. Use /start_app {app_id} to run it.")
 
-async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id): return
+async def start_app(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_team_member(update.effective_user.id): return
     if not context.args:
-        await update.message.reply_text("Usage: /ban <user_id>")
+        await update.message.reply_text("Usage: /start_app <app_id>")
         return
-    
-    target_id = int(context.args[0])
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET is_banned = 1 WHERE user_id = ?", (target_id,))
-        await db.commit()
-    await update.message.reply_text(f"🚫 User {target_id} has been banned.")
 
-async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id): return
+    app_id = int(context.args[0])
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = sqlite3.Row
+        async with db.execute("SELECT * FROM hosted_apps WHERE app_id = ? AND user_id = ?", (app_id, update.effective_user.id)) as cursor:
+            app = await cursor.fetchone()
+
+    if not app:
+        await update.message.reply_text("❌ App not found.")
+        return
+
+    if app['status'] == 'running':
+        await update.message.reply_text("ℹ️ App is already running.")
+        return
+
+    # Start process
+    log_file = os.path.join(LOGS_DIR, f"app_{app_id}.log")
+    with open(log_file, "w") as f:
+        process = subprocess.Popen([sys.executable, app['path']], stdout=f, stderr=f)
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE hosted_apps SET status = 'running', pid = ? WHERE app_id = ?", (process.pid, app_id))
+        await db.commit()
+
+    await update.message.reply_text(f"🚀 App {app['app_name']} started (PID: {process.pid}).")
+
+async def stop_app(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_team_member(update.effective_user.id): return
     if not context.args:
-        await update.message.reply_text("Usage: /unban <user_id>")
+        await update.message.reply_text("Usage: /stop <app_id>")
         return
-    
-    target_id = int(context.args[0])
+
+    app_id = int(context.args[0])
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET is_banned = 0 WHERE user_id = ?", (target_id,))
+        db.row_factory = sqlite3.Row
+        async with db.execute("SELECT * FROM hosted_apps WHERE app_id = ? AND user_id = ?", (app_id, update.effective_user.id)) as cursor:
+            app = await cursor.fetchone()
+
+    if not app or app['status'] == 'stopped':
+        await update.message.reply_text("❌ App is not running.")
+        return
+
+    try:
+        parent = psutil.Process(app['pid'])
+        for child in parent.children(recursive=True):
+            child.terminate()
+        parent.terminate()
+        await update.message.reply_text(f"🛑 App {app['app_name']} stopped.")
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Error stopping app: {e}")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE hosted_apps SET status = 'stopped', pid = NULL WHERE app_id = ?", (app_id,))
         await db.commit()
-    await update.message.reply_text(f"✅ User {target_id} has been unbanned.")
 
-# Callback Query Handler
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+async def list_apps(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_team_member(update.effective_user.id): return
     
-    if query.data == "check_join":
-        if await check_force_join(update, context):
-            await query.edit_message_text("Thank you for joining! You can now use the bot. Type /start to begin.")
-        else:
-            await query.message.reply_text("You haven't joined yet! Please join the channel first.")
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = sqlite3.Row
+        async with db.execute("SELECT * FROM hosted_apps WHERE user_id = ?", (update.effective_user.id,)) as cursor:
+            apps = await cursor.fetchall()
 
-# Main function
+    if not apps:
+        await update.message.reply_text("📭 No apps hosted yet.")
+        return
+
+    msg = "📂 Your Hosted Apps:\n\n"
+    for app in apps:
+        msg += f"ID: {app['app_id']} | {app['app_name']} | Status: {app['status']}\n"
+    
+    await update.message.reply_text(msg)
+
+async def delete_app(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_team_member(update.effective_user.id): return
+    if not context.args:
+        await update.message.reply_text("Usage: /delete <app_id>")
+        return
+
+    app_id = int(context.args[0])
+    # Stop first if running
+    await stop_app(update, context)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = sqlite3.Row
+        async with db.execute("SELECT path FROM hosted_apps WHERE app_id = ?", (app_id,)) as cursor:
+            app = await cursor.fetchone()
+            if app:
+                if os.path.exists(app['path']):
+                    os.remove(app['path'])
+                await db.execute("DELETE FROM hosted_apps WHERE app_id = ?", (app_id,))
+                await db.commit()
+                await update.message.reply_text("🗑️ App deleted.")
+            else:
+                await update.message.reply_text("❌ App not found.")
+
+async def system_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_team_member(update.effective_user.id): return
+    
+    cpu = psutil.cpu_percent()
+    ram = psutil.virtual_memory().percent
+    disk = psutil.disk_usage('/').percent
+    
+    await update.message.reply_text(
+        f"🖥️ System Status:\n"
+        f"CPU: {cpu}%\n"
+        f"RAM: {ram}%\n"
+        f"Disk: {disk}%"
+    )
+
+# Main
 async def main():
     await init_db()
-    
     application = ApplicationBuilder().token(BOT_TOKEN).build()
     
-    # Handlers
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("profile", profile))
-    application.add_handler(CommandHandler("buy", buy))
+    application.add_handler(CommandHandler("apps", list_apps))
+    application.add_handler(CommandHandler("start_app", start_app))
+    application.add_handler(CommandHandler("stop", stop_app))
+    application.add_handler(CommandHandler("delete", delete_app))
+    application.add_handler(CommandHandler("status", system_status))
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     
-    # Admin Handlers
-    application.add_handler(CommandHandler("stats", stats))
-    application.add_handler(CommandHandler("broadcast", broadcast))
-    application.add_handler(CommandHandler("addpremium", add_premium))
-    application.add_handler(CommandHandler("givecredits", give_credits))
-    application.add_handler(CommandHandler("ban", ban_user))
-    application.add_handler(CommandHandler("unban", unban_user))
-    
-    application.add_handler(CallbackQueryHandler(button_callback))
-    
-    logger.info("Bot started...")
+    logger.info("PyHost Team Bot started...")
     await application.run_polling()
 
 if __name__ == '__main__':

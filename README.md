@@ -1,44 +1,38 @@
-# PyHost Telegram Bot
+# PyHost Team Private Hosting Bot
 
-A professional, production-ready Telegram bot with a user system, credit system, admin panel, and force join functionality.
+An advanced, private Telegram bot designed for team use. It allows team members to upload Python bot codes, which are then automatically hosted, managed, and run with auto-dependency installation.
 
-## Features
-- **User System**: Auto-registration, profile management.
-- **Credit System**: Limited credits for free users, unlimited for premium.
-- **Premium System**: Admin-managed premium status with expiry.
-- **Admin Panel**: Stats, broadcast, user management (ban/unban, credits, premium).
-- **Force Join**: Ensures users join a specific channel before using the bot.
-- **Railway Ready**: Pre-configured for easy deployment on Railway.app.
+## 🚀 Features
+- **Private Team Use**: Restricted to specific IDs (Owner & Admin).
+- **Auto-Hosting**: Send any `.py` file to the bot, and it will save it.
+- **Auto-Dependency Installer**: Automatically detects `import` statements and installs missing modules via `pip`.
+- **Process Management**: Start, stop, and delete hosted apps via commands.
+- **System Monitoring**: Check CPU, RAM, and Disk usage.
+- **Multi-App Support**: Host multiple bots simultaneously.
 
-## Setup Instructions
+## 🛠️ Commands
+- `/start` - Welcome message and command list.
+- `/apps` - List all your hosted applications and their status.
+- `/start_app <id>` - Start a specific application.
+- `/stop <id>` - Stop a running application.
+- `/delete <id>` - Remove an application and its files.
+- `/status` - View system resource usage.
+- **File Upload**: Simply send a `.py` file to register it for hosting.
 
-### 1. Local Setup
-1. Clone the repository.
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-3. Create a `.env` file based on `.env.example` and fill in your credentials.
-4. Run the bot:
-   ```bash
-   python main.py
-   ```
+## 📦 Setup
+1. **Environment Variables**:
+   - `BOT_TOKEN`: Your Telegram Bot Token.
+   - `OWNER_ID`: Main team leader ID.
+   - `ADMIN_ID`: Secondary team admin ID.
+   - `UPDATE_CHANNEL`: Your team's update channel.
+   - `YOUR_USERNAME`: Support contact.
 
-### 2. Railway Deployment
-1. Connect your GitHub repository to Railway.
-2. Add the environment variables from your `.env` file to the Railway project settings.
-3. Railway will automatically detect the `railway.json` and `requirements.txt` to build and deploy the bot.
+2. **Deployment**:
+   - Deploy on Railway or any VPS.
+   - The bot will create a `hosted_bots` folder to store uploaded codes and a `logs` folder for app outputs.
 
-## Environment Variables
-- `BOT_TOKEN`: Your Telegram Bot API token.
-- `OWNER_ID`: Your Telegram User ID (Main Admin).
-- `ADMIN_ID`: Secondary Admin User ID.
-- `YOUR_USERNAME`: Your Telegram username for support/sales.
-- `UPDATE_CHANNEL`: Link to your Telegram update channel.
-- `PORT`: Port for the bot (default: 8080).
-
-## Database
-The bot uses **SQLite** by default (`bot_database.db`). The schema is automatically created on the first run.
+## ⚠️ Security Note
+This bot is for **private team use only**. It executes uploaded Python code, so ensure only trusted team members have access.
 
 ## License
 MIT
