@@ -6,7 +6,6 @@ import aiosqlite
 import subprocess
 import sys
 import psutil
-import shutil
 from datetime import datetime
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -115,23 +114,22 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(f"📥 Received {app_name}. Analyzing dependencies...")
 
-    # Auto-install modules (simple regex check for imports)
     try:
         with open(file_path, 'r') as f:
             content = f.read()
-            import_lines = [line for line in content.split('\n') if line.startswith('import ') or line.startswith('from ')]
+            import_lines = [line for line in content.split('\n') if line.strip().startswith('import ') or line.strip().startswith('from ')]
             modules = []
             for line in import_lines:
-                parts = line.split()
+                parts = line.strip().split()
+                if not parts: continue
                 if parts[0] == 'import':
                     modules.append(parts[1].split('.')[0])
                 elif parts[0] == 'from':
                     modules.append(parts[1].split('.')[0])
             
             unique_modules = list(set(modules))
-            # Filter out standard libraries (simplified)
-            std_libs = ['os', 'sys', 'time', 'datetime', 'json', 're', 'math', 'random', 'asyncio', 'logging', 'sqlite3']
-            to_install = [m for m in unique_modules if m not in std_libs]
+            std_libs = ['os', 'sys', 'time', 'datetime', 'json', 're', 'math', 'random', 'asyncio', 'logging', 'sqlite3', 'subprocess', 'threading']
+            to_install = [m for m in unique_modules if m not in std_libs and m]
 
             if to_install:
                 await update.message.reply_text(f"📦 Installing: {', '.join(to_install)}")
@@ -140,7 +138,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"⚠️ Dependency check failed: {e}")
 
-    # Register in DB
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "INSERT INTO hosted_apps (user_id, app_name, path, status) VALUES (?, ?, ?, ?)",
@@ -158,7 +155,12 @@ async def start_app(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /start_app <app_id>")
         return
 
-    app_id = int(context.args[0])
+    try:
+        app_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Invalid ID.")
+        return
+
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = sqlite3.Row
         async with db.execute("SELECT * FROM hosted_apps WHERE app_id = ? AND user_id = ?", (app_id, update.effective_user.id)) as cursor:
@@ -172,16 +174,18 @@ async def start_app(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("ℹ️ App is already running.")
         return
 
-    # Start process
     log_file = os.path.join(LOGS_DIR, f"app_{app_id}.log")
-    with open(log_file, "w") as f:
-        process = subprocess.Popen([sys.executable, app['path']], stdout=f, stderr=f)
-    
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE hosted_apps SET status = 'running', pid = ? WHERE app_id = ?", (process.pid, app_id))
-        await db.commit()
+    try:
+        with open(log_file, "w") as f:
+            process = subprocess.Popen([sys.executable, app['path']], stdout=f, stderr=f)
+        
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE hosted_apps SET status = 'running', pid = ? WHERE app_id = ?", (process.pid, app_id))
+            await db.commit()
 
-    await update.message.reply_text(f"🚀 App {app['app_name']} started (PID: {process.pid}).")
+        await update.message.reply_text(f"🚀 App {app['app_name']} started (PID: {process.pid}).")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to start app: {e}")
 
 async def stop_app(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_team_member(update.effective_user.id): return
@@ -189,7 +193,12 @@ async def stop_app(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /stop <app_id>")
         return
 
-    app_id = int(context.args[0])
+    try:
+        app_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Invalid ID.")
+        return
+
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = sqlite3.Row
         async with db.execute("SELECT * FROM hosted_apps WHERE app_id = ? AND user_id = ?", (app_id, update.effective_user.id)) as cursor:
@@ -205,6 +214,8 @@ async def stop_app(update: Update, context: ContextTypes.DEFAULT_TYPE):
             child.terminate()
         parent.terminate()
         await update.message.reply_text(f"🛑 App {app['app_name']} stopped.")
+    except psutil.NoSuchProcess:
+        await update.message.reply_text("ℹ️ Process already stopped.")
     except Exception as e:
         await update.message.reply_text(f"⚠️ Error stopping app: {e}")
 
@@ -236,7 +247,12 @@ async def delete_app(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /delete <app_id>")
         return
 
-    app_id = int(context.args[0])
+    try:
+        app_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Invalid ID.")
+        return
+
     # Stop first if running
     await stop_app(update, context)
 
@@ -268,7 +284,7 @@ async def system_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # Main
-async def main():
+async def run_bot():
     await init_db()
     application = ApplicationBuilder().token(BOT_TOKEN).build()
     
@@ -280,8 +296,29 @@ async def main():
     application.add_handler(CommandHandler("status", system_status))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     
-    logger.info("PyHost Team Bot started...")
-    await application.run_polling()
+    logger.info("PyHost Team Bot starting...")
+    
+    async with application:
+        await application.initialize()
+        await application.start()
+        await application.updater.start_polling()
+        
+        # Keep the bot running
+        while True:
+            await asyncio.sleep(1)
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    try:
+        # Check if an event loop is already running
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # If running, create a task in the existing loop
+            loop.create_task(run_bot())
+        else:
+            # If not running, use asyncio.run()
+            asyncio.run(run_bot())
+    except RuntimeError:
+        # Fallback for environments where get_event_loop() fails
+        asyncio.run(run_bot())
+    except KeyboardInterrupt:
+        pass
